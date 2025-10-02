@@ -1,0 +1,246 @@
+import json
+import warnings
+from pathlib import Path
+
+import networkx as nx
+import numpy as np
+import pandas as pd
+import xmltodict
+
+from pathlib import Path
+from src.data.topology_zoo_matching import LINK_TYPE_TO_BANDWIDTH, LINK_NOTE_TO_BANDWIDTH, LINK_LABEL_TO_BANDWIDTH
+from src.data.types import FLOAT
+
+
+def read_graph_csv(folder: Path) -> nx.DiGraph:
+    node = pd.read_csv(f"{folder}/Node.csv", sep=",")
+    topo = pd.read_csv(f"{folder}/topo.csv", sep=",")
+    graph = nx.DiGraph()
+    graph.add_nodes_from(node.index)
+    edges = topo.loc[:, ["src", "dst"]].to_numpy()
+    cost = topo["IGP cost"].astype(FLOAT).to_numpy()
+    bandwidth = topo["cap"].astype(FLOAT).to_numpy()
+    for edge, c, b in zip(edges, cost, bandwidth):
+        graph.add_edge(edge[0], edge[1], cost=c, bandwidth=b)
+    return graph
+
+
+def read_traffic_mat_csv(filename: Path) -> np.ndarray:
+    tunnel = pd.read_csv(filename, sep=",")
+    traffic_mat = np.zeros((tunnel["src"].max() + 1, tunnel["dst"].max() + 1), dtype=FLOAT)
+    traffic_mat[tunnel["src"], tunnel["dst"]] = tunnel["bandwidth"]
+    return traffic_mat / 1e6
+
+
+def read_graph_sndlib_xml(filename: Path) -> nx.Graph:
+    with open(filename, "r") as file:
+        graph_dct = xmltodict.parse(file.read())["network"]["networkStructure"]
+
+    graph = nx.DiGraph()
+
+    for node in graph_dct["nodes"]["node"]:
+        graph.add_node(node["@id"], x=FLOAT(node["coordinates"]["x"]), y=FLOAT(node["coordinates"]["y"]))
+
+    for edge in graph_dct["links"]["link"]:
+        cost = FLOAT(edge.get("routingCost", 1.0))
+        if "preInstalledModule" in edge:
+            bandwidth = FLOAT(edge["preInstalledModule"]["capacity"])
+        elif "additionalModules" in edge and "addModule" in edge["additionalModules"]:
+            module = edge["additionalModules"]["addModule"]
+            if isinstance(module, list):
+                module = module[0]
+            bandwidth = FLOAT(module["capacity"])
+        else:
+            bandwidth = FLOAT(1.0)
+        graph.add_edge(edge["source"], edge["target"], cost=cost, bandwidth=bandwidth)
+        graph.add_edge(edge["target"], edge["source"], cost=cost, bandwidth=bandwidth)
+
+    return graph
+
+
+def read_traffic_mat_sndlib_xml(filename) -> np.ndarray:
+    with open(filename, "r") as file:
+        xml_dct = xmltodict.parse(file.read())["network"]
+
+    node_label_to_num = {node["@id"]: i for i, node in enumerate(xml_dct["networkStructure"]["nodes"]["node"])}
+    traffic_mat = np.zeros((len(node_label_to_num), len(node_label_to_num)), dtype=FLOAT)
+    for demand in xml_dct["demands"]["demand"]:
+        source = node_label_to_num[demand["source"]]
+        target = node_label_to_num[demand["target"]]
+        traffic_mat[source, target] = demand["demandValue"]
+    return traffic_mat
+
+
+def read_metadata_networks_tntp(filename: Path) -> dict:
+    with open(filename, "r") as file:
+        zones = int(file.readline()[len("<NUMBER OF ZONES>") :].strip())
+        nodes = int(file.readline()[len("<NUMBER OF NODES>") :].strip())
+        can_pass_through_zones = int(file.readline()[len("<FIRST THRU NODE>") :].strip()) == 1
+    return dict(zones=zones, nodes=nodes, can_pass_through_zones=can_pass_through_zones)
+
+
+def read_graph_transport_networks_tntp(filename: Path) -> nx.DiGraph:
+    # Made on the basis of
+    # https://github.com/bstabler/TransportationNetworks/blob/master/_scripts/parsing%20networks%20in%20Python.ipynb
+
+    metadata = read_metadata_networks_tntp(filename)
+
+    net = pd.read_csv(filename, skiprows=8, sep="\t")
+    net.columns = [col.strip().lower() for col in net.columns]
+    net = net.loc[:, ["init_node", "term_node", "capacity", "free_flow_time"]]
+    net.loc[:, ["init_node", "term_node"]] -= 1
+
+    graph = nx.DiGraph()
+    graph.add_nodes_from(range(metadata["nodes"] + (0 if metadata["can_pass_through_zones"] else metadata["zones"])))
+
+    for row in net.iterrows():
+        source = row[1].init_node
+        dest = row[1].term_node
+        if not metadata["can_pass_through_zones"] and dest < metadata["zones"]:
+            dest += metadata["nodes"]
+        graph.add_edge(source, dest, cost=FLOAT(row[1].free_flow_time), bandwidth=FLOAT(row[1].capacity))
+
+    return graph
+
+
+def read_traffic_mat_transport_networks_tntp(filename: Path, metadata: dict) -> np.ndarray:
+    # Made on the basis of
+    # https://github.com/bstabler/TransportationNetworks/blob/master/_scripts/parsing%20networks%20in%20Python.ipynb
+
+    with open(filename, "r") as file:
+        blocks = file.read().split("Origin")[1:]
+    matrix = {}
+    for block in blocks:
+        demand_data_for_source = block.split("\n")
+        source = int(demand_data_for_source[0])
+        targets = ";".join(demand_data_for_source[1:]).split(";")
+        matrix[source] = {}
+        for target_str in targets:
+            if len(target_str.strip()) == 0:
+                continue
+            target, demand = target_str.split(":")
+            matrix[source][int(target)] = FLOAT(demand)
+
+    zones = metadata["zones"]
+    zone_demands = np.zeros((zones, zones))
+    for i in range(zones):
+        for j in range(zones):
+            zone_demands[i, j] = matrix.get(i + 1, {}).get(j + 1, 0)
+
+    num_nodes = metadata["nodes"]
+    num_nodes += 0 if metadata["can_pass_through_zones"] else metadata["zones"]
+    traffic_mat = np.zeros((num_nodes, num_nodes), dtype=FLOAT)
+    if metadata["can_pass_through_zones"]:
+        traffic_mat[:zones, :zones] = zone_demands
+    else:
+        traffic_mat[:zones, -zones:] = zone_demands
+    return traffic_mat
+
+
+def update_node_coordinates(node_coords: dict, metadata: dict):
+    if not metadata["can_pass_through_zones"]:
+        for key in range(metadata["zones"]):
+            node_coords[key + metadata["nodes"]] = node_coords[key].copy()
+
+
+def read_node_coordinates_transport_networks_tntp(filename: Path, metadata: dict) -> dict:
+    with open(filename, "r") as file:
+        try:
+            data = pd.read_csv(
+                filename,
+                delim_whitespace=True,
+                header=0,
+                names=["node", "x", "y", "semicolon"],
+            )
+        except pd.errors.ParserError:
+            data = pd.read_csv(filename, delim_whitespace=True, header=0, names=["node", "x", "y"])
+    data = data.loc[:, ["x", "y"]]
+
+    node_coords = {}
+    for row in data.iterrows():
+        node_coords[row[0]] = {"x": FLOAT(row[1].x), "y": FLOAT(row[1].y)}
+
+    update_node_coordinates(node_coords, metadata)
+    return node_coords
+
+
+def read_node_coordinates_transport_networks_geojson(filename: Path, metadata: dict) -> dict:
+    with open(filename, "r") as file:
+        geodata = json.load(file)
+
+    node_coords = {}
+    for node, feature in enumerate(geodata["features"]):
+        coords = feature["geometry"]["coordinates"]
+        node_coords[node - 1] = {"x": FLOAT(coords[0]), "y": FLOAT(coords[1])}
+
+    update_node_coordinates(node_coords, metadata)
+    return node_coords
+
+
+def read_graph_topology_zoo(filename: Path, bandwidth_fill_nan_strategy: str = "max") -> nx.Graph:
+    """
+    Read graph from .gml file of topology_zoo collection http://www.topology-zoo.org/dataset.html.
+    Link costs (delays) are not given in data and are filled with 1.
+
+    Link bandwidths are given in one of several fields in the .gml file. That are: LinkSpeedRaw,
+    LinkType, LinkNote, LinkLabel. The functions tries to read the bandwidths from these fields
+    according to the transcript in topology_zoo_matching.py.
+
+    If bandwidth of the edge not given in any of the four fields, it is filled with max/min value
+    (depending on bandwidth_fill_nan_strategy) over the other fields. If all bandwidths are not
+    given, then they are filled with 1.
+
+    :param filename: Path, path to .gml file
+    :param bandwidth_fill_nan_strategy: str, default 'max', the way to fill the None values in
+    missing bandwidths. If 'max', fill with maximum of non-None bandwidths. If 'min', fill with
+    minimum of non-None bandwidths.
+    """
+    graph_from_gml = nx.read_gml(filename, label=None)
+    graph = nx.DiGraph()
+
+    if bandwidth_fill_nan_strategy not in ["max", "min"]:
+        raise ValueError(
+            f"Unknown bandwidth_fill_nan_strategy: '{bandwidth_fill_nan_strategy}', expected 'min', 'max' or None"
+        )
+
+    for node in graph_from_gml.nodes:
+        graph.add_node(node)
+
+    bandwidth_list = []
+    for edge in graph_from_gml.edges:
+        bandwidth = None
+        params = graph_from_gml.edges[edge]
+        if "LinkSpeedRaw" in params:
+            bandwidth = params["LinkSpeedRaw"]
+        elif "LinkType" in params:
+            bandwidth = LINK_TYPE_TO_BANDWIDTH[params["LinkType"]]
+        elif "LinkNote" in params:
+            bandwidth = LINK_NOTE_TO_BANDWIDTH[params["LinkNote"]]
+        elif "LinkLabel" in params:
+            bandwidth = LINK_LABEL_TO_BANDWIDTH[params["LinkLabel"]]
+        bandwidth_list.append(bandwidth)
+
+    not_none_bandwidth_list = [item for item in bandwidth_list if item is not None]
+    if len(not_none_bandwidth_list) == 0:
+        warnings.warn(f"All bandwidths are None for {filename}, filling with 1.", category=RuntimeWarning)
+        fill_value = 1.0
+    elif bandwidth_fill_nan_strategy == "max":
+        fill_value = max(not_none_bandwidth_list)
+    else:
+        fill_value = min(not_none_bandwidth_list)
+
+    bandwidth_list = [fill_value if item is None else item for item in bandwidth_list]
+    for edge, bandwidth in zip(graph_from_gml.edges, bandwidth_list):
+        graph.add_edge(edge[0], edge[1], cost=FLOAT(1.0), bandwidth=FLOAT(bandwidth))
+
+    return graph
+
+
+def scale_graph_bandwidth_and_cost(graph: nx.Graph) -> nx.Graph:
+    scaled_graph = graph.copy()
+    max_bandwidth = max(nx.get_edge_attributes(graph, "bandwidth").values())
+    max_cost = max(nx.get_edge_attributes(graph, "cost").values())
+    for edge in graph.edges:
+        scaled_graph.edges[edge]["bandwidth"] /= max_bandwidth
+        scaled_graph.edges[edge]["cost"] /= max_cost
+    return scaled_graph
